@@ -79,8 +79,11 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         .replace(/\bnot\s+/g, '!')
         .replace(/\band\b/g, '&&')
         .replace(/\bor\b/g, '||')
-        .replace(/\/\//g, 'Math.floor($1/$2)')
-        .replace(/\*\*/g, 'Math.pow($1,$2)');
+        .replace(/\/\//g, 'Math.floor')
+        .replace(/\*\*/g, '**');
+
+      // Handle power operator
+      jsExpression = jsExpression.replace(/(\d+|\w+)\s*\*\*\s*(\d+|\w+)/g, 'Math.pow($1, $2)');
 
       // Handle string literals
       jsExpression = jsExpression.replace(/'([^']*)'/g, '"$1"');
@@ -90,25 +93,10 @@ const PythonCodeVisualizer = ({ initialCode }) => {
       const func = new Function(...Object.keys(allVariables), `return ${jsExpression};`);
       return func(...Object.values(allVariables));
     } catch (err) {
-      // Try to handle simple assignments
-      if (expression.includes('=') && !['==', '!=', '<=', '>=', '+='].some(op => expression.includes(op))) {
-        const parts = expression.split('=');
-        if (parts.length === 2) {
-          const rightSide = parts[1].trim();
-          if (rightSide in variables) return variables[rightSide];
-          if (!isNaN(rightSide)) return parseFloat(rightSide);
-          if (rightSide.startsWith('"') && rightSide.endsWith('"')) return rightSide.slice(1, -1);
-          if (rightSide.startsWith("'") && rightSide.endsWith("'")) return rightSide.slice(1, -1);
-          if (rightSide === 'True') return true;
-          if (rightSide === 'False') return false;
-          if (rightSide === 'None') return null;
-        }
-      }
       throw new Error(`Error evaluating: ${expression} - ${err.message}`);
     }
   };
 
-  // Function to parse multi-line structures (dictionaries, lists)
   const parseMultiLineStructure = (lines, startIndex) => {
     let structure = '';
     let braceCount = 0;
@@ -211,7 +199,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         }
         
         // Handle other statements in function
-        const result = processLine(bodyLine, functionScope, functionOutput);
+        const result = processLine(bodyLine, functionScope, functionOutput, lines);
         Object.assign(functionScope, result.variables);
         functionOutput.push(...result.output);
       } catch (err) {
@@ -225,50 +213,93 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     return returnValue;
   };
 
-  // Parse Python code into executable steps
-  const parseCode = (codeString) => {
-    const lines = codeString.split('\n').map((line, i) => ({ 
-      content: line, 
-      originalIndex: i,
-      trimmed: line.trim(),
-      indent: line.length - line.trimStart().length
-    }));
-    
-    const steps = [];
-    let variables = {};
-    let output = [];
+  // Helper function to process a single line
+  const processLine = (lineData, currentVars, currentOutput, lines) => {
+    const { content: line, originalIndex, trimmed, indent } = lineData;
+    const lineSteps = [];
+    let vars = { ...currentVars };
+    let out = [...currentOutput];
 
-    // Helper function to process a single line
-    const processLine = (lineData, currentVars, currentOutput) => {
-      const { content: line, originalIndex, trimmed, indent } = lineData;
-      const lineSteps = [];
-      let vars = { ...currentVars };
-      let out = [...currentOutput];
+    // Skip empty lines and comments
+    if (trimmed === '' || trimmed.startsWith('#')) {
+      return { steps: lineSteps, variables: vars, output: out };
+    }
 
-      // Skip empty lines and comments
-      if (trimmed === '' || trimmed.startsWith('#')) {
-        return { steps: lineSteps, variables: vars, output: out };
-      }
-
-      try {
-        // Handle variable assignment
-        if (trimmed.includes('=') && !['==', '!=', '<=', '>=', '+=', '-=', '*=', '/=', '%='].some(op => trimmed.includes(op))) {
-          const parts = trimmed.split('=');
-          const varName = parts[0].trim();
-          const expression = parts.slice(1).join('=').trim();
-          
-          let value;
-          
-          // Check for list comprehension
-          if (expression.match(/\[.*?\s+for\s+\w+\s+in\s+.*?\]/)) {
-            try {
-              value = parseListComprehension(expression, vars);
-            } catch (err) {
-              throw new Error(`List comprehension error: ${err.message}`);
+    try {
+      // Handle variable assignment
+      if (trimmed.includes('=') && !['==', '!=', '<=', '>=', '+=', '-=', '*=', '/=', '%='].some(op => trimmed.includes(op))) {
+        const parts = trimmed.split('=');
+        const varName = parts[0].trim();
+        const expression = parts.slice(1).join('=').trim();
+        
+        let value;
+        
+        // Check for list comprehension
+        if (expression.match(/\[.*?\s+for\s+\w+\s+in\s+.*?\]/)) {
+          try {
+            value = parseListComprehension(expression, vars);
+          } catch (err) {
+            throw new Error(`List comprehension error: ${err.message}`);
+          }
+        }
+        // Check for function calls that return values
+        else if (expression.match(/\w+\(.*\)/)) {
+          const funcMatch = expression.match(/(\w+)\((.*)\)/);
+          if (funcMatch) {
+            const [, funcName, argsStr] = funcMatch;
+            
+            if (vars[funcName] && typeof vars[funcName] === 'object' && vars[funcName].isFunction) {
+              // Parse arguments properly
+              let args = [];
+              if (argsStr.trim()) {
+                // Split by commas but handle nested structures
+                const argParts = [];
+                let current = '';
+                let depth = 0;
+                let inString = false;
+                let stringChar = '';
+                
+                for (let i = 0; i < argsStr.length; i++) {
+                  const char = argsStr[i];
+                  
+                  if (!inString && (char === '"' || char === "'")) {
+                    inString = true;
+                    stringChar = char;
+                  } else if (inString && char === stringChar) {
+                    inString = false;
+                  } else if (!inString) {
+                    if (char === '(' || char === '[' || char === '{') depth++;
+                    else if (char === ')' || char === ']' || char === '}') depth--;
+                    else if (char === ',' && depth === 0) {
+                      argParts.push(current.trim());
+                      current = '';
+                      continue;
+                    }
+                  }
+                  current += char;
+                }
+                if (current.trim()) argParts.push(current.trim());
+                
+                args = argParts.map(arg => safeEval(arg, vars));
+              }
+              
+              try {
+                value = handleFunctionCall(funcName, args, vars, out);
+              } catch (err) {
+                throw new Error(`Function call error: ${err.message}`);
+              }
+            } else {
+              // Regular expression evaluation (built-in functions, etc.)
+              try {
+                value = safeEval(expression, vars);
+              } catch (err) {
+                // If it's not a function call or evaluation, treat as string
+                value = expression;
+              }
             }
           }
-          // Check for multi-line dictionary or list
-          else if ((expression.startsWith('{') || expression.startsWith('[')) && 
+        }
+        else if ((expression.startsWith('{') || expression.startsWith('[')) && 
                    (!expression.endsWith('}') && !expression.endsWith(']'))) {
             // Find the complete structure across multiple lines
             const { structure } = parseMultiLineStructure(lines, originalIndex);
@@ -287,376 +318,461 @@ const PythonCodeVisualizer = ({ initialCode }) => {
               value = fullExpression;
             }
           }
-          // Handle single-line structures
-          else if (expression.startsWith('[') && expression.endsWith(']')) {
-            try {
-              value = JSON.parse(expression.replace(/'/g, '"'));
-            } catch {
-              value = expression;
-            }
-          } 
-          else if (expression.startsWith('{') && expression.endsWith('}')) {
-            try {
-              value = JSON.parse(expression.replace(/'/g, '"').replace(/(\w+):/g, '"$1":'));
-            } catch {
-              value = expression;
-            }
-          }
-          // Handle function calls that return values
-          else if (expression.match(/\w+\(.*\)/)) {
-            const funcMatch = expression.match(/(\w+)\((.*)\)/);
-            if (funcMatch) {
-              const [, funcName, argsStr] = funcMatch;
-              
-              if (vars[funcName] && typeof vars[funcName] === 'object' && vars[funcName].isFunction) {
-                // Parse arguments
-                const args = argsStr ? argsStr.split(',').map(arg => safeEval(arg.trim(), vars)) : [];
-                
-                try {
-                  value = handleFunctionCall(funcName, args, vars, out);
-                } catch (err) {
-                  throw new Error(`Function call error: ${err.message}`);
-                }
-              } else {
-                // Regular expression evaluation
-                try {
-                  value = safeEval(expression, vars);
-                } catch (err) {
-                  value = expression;
-                }
-              }
-            }
-          }
-          // Regular expression evaluation
-          else {
+        // Handle single-line structures
+        else if (expression.startsWith('[') && expression.endsWith(']')) {
+          try {
+            // Try to parse as JSON first
+            const jsonStr = expression.replace(/'/g, '"');
+            value = JSON.parse(jsonStr);
+          } catch {
+            // If JSON parsing fails, evaluate as expression
             try {
               value = safeEval(expression, vars);
-            } catch (err) {
+            } catch {
               value = expression;
             }
           }
-          
-          const oldValue = vars[varName];
-          vars[varName] = value;
-          
-          lineSteps.push({
-            line: originalIndex,
-            action: oldValue !== undefined ? 'reassign' : 'assign',
-            variable: varName,
-            value: value,
-            oldValue: oldValue,
-            expression: expression,
-            variables: JSON.parse(JSON.stringify(vars)),
-            output: [...out]
-          });
-        }
-        // Handle augmented assignments (like +=, -=)
-        else if (trimmed.match(/[\w]+\s*[\+\-\*\/%]=\s*.+/)) {
-          const match = trimmed.match(/(\w+)\s*([\+\-\*\/%])=(.+)/);
-          if (match) {
-            const [_, varName, operator, rightExpr] = match;
-            const oldValue = vars[varName];
-            let rightValue;
-            
+        } 
+        else if (expression.startsWith('{') && expression.endsWith('}')) {
+          try {
+            // Convert Python dict syntax to JSON
+            const jsonStr = expression
+              .replace(/'/g, '"')
+              .replace(/(\w+):/g, '"$1":')
+              .replace(/True/g, 'true')
+              .replace(/False/g, 'false')
+              .replace(/None/g, 'null');
+            value = JSON.parse(jsonStr);
+          } catch {
             try {
-              rightValue = safeEval(rightExpr.trim(), vars);
-            } catch (err) {
-              rightValue = rightExpr.trim();
+              value = safeEval(expression, vars);
+            } catch {
+              value = expression;
             }
-            
-            let newValue;
-            if (operator === '+') {
-              if (typeof oldValue === 'string' || typeof rightValue === 'string') {
-                newValue = String(oldValue) + String(rightValue);
-              } else {
-                newValue = oldValue + rightValue;
-              }
-            } else if (operator === '-') {
-              newValue = oldValue - rightValue;
-            } else if (operator === '*') {
-              newValue = oldValue * rightValue;
-            } else if (operator === '/') {
-              newValue = oldValue / rightValue;
-            } else if (operator === '%') {
-              newValue = oldValue % rightValue;
-            }
-            
-            vars[varName] = newValue;
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'augmented_assign',
-              variable: varName,
-              operator: operator,
-              value: newValue,
-              oldValue: oldValue,
-              rightValue: rightValue,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
           }
         }
-        // Handle list operations
-        else if (trimmed.match(/\w+\.(append|extend|remove|pop|insert|index|count)\(/)) {
-          const match = trimmed.match(/(\w+)\.(\w+)\((.*)\)/);
-          if (match) {
-            const [_, listName, operation, args] = match;
-            const list = vars[listName];
-            
-            if (!Array.isArray(list)) {
-              throw new Error(`'${typeof list}' object has no attribute '${operation}'`);
-            }
-            
-            const oldList = [...list];
-            let operationResult = '';
-            let resultValue = null;
-            
-            if (operation === 'append') {
-              const value = safeEval(args, vars);
-              list.push(value);
-              operationResult = `Appended ${helperFunctions.__repr(value)} to ${listName}`;
-            } 
-            else if (operation === 'extend') {
-              const iterable = safeEval(args, vars);
-              if (Array.isArray(iterable)) {
-                list.push(...iterable);
-                operationResult = `Extended ${listName} with ${helperFunctions.__repr(iterable)}`;
-              } else {
-                throw new Error(`'${typeof iterable}' object is not iterable`);
-              }
-            }
-            else if (operation === 'remove') {
-              const value = safeEval(args, vars);
-              const index = list.indexOf(value);
-              if (index > -1) {
-                list.splice(index, 1);
-                operationResult = `Removed first occurrence of ${helperFunctions.__repr(value)} from ${listName}`;
-              } else {
-                throw new Error(`Value ${helperFunctions.__repr(value)} not found in list`);
-              }
-            }
-            else if (operation === 'pop') {
-              if (args.trim() === '') {
-                resultValue = list.pop();
-                operationResult = `Popped last element (${helperFunctions.__repr(resultValue)}) from ${listName}`;
-              } else {
-                const index = parseInt(safeEval(args, vars));
-                resultValue = list.splice(index, 1)[0];
-                operationResult = `Popped element at index ${index} (${helperFunctions.__repr(resultValue)}) from ${listName}`;
-              }
-            }
-            else if (operation === 'insert') {
-              const [indexStr, valueStr] = args.split(',').map(s => s.trim());
-              const index = parseInt(safeEval(indexStr, vars));
-              const value = safeEval(valueStr, vars);
-              list.splice(index, 0, value);
-              operationResult = `Inserted ${helperFunctions.__repr(value)} at index ${index} in ${listName}`;
-            }
-            
-            vars[listName] = list;
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'list_operation',
-              list: listName,
-              operation: operation,
-              value: list,
-              oldValue: oldList,
-              operationResult: operationResult,
-              resultValue: resultValue,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
-        }
-        // Handle print statements
-        else if (trimmed.startsWith('print(')) {
-          const printMatch = trimmed.match(/print\((.*)\)/);
-          if (printMatch) {
-            const args = printMatch[1];
-            let printValue;
-            
-            try {
-              printValue = safeEval(args, vars);
-            } catch (err) {
-              printValue = args.replace(/['"]/g, '');
-            }
-            
-            const outputText = Array.isArray(printValue) ? 
-              `[${printValue.map(item => helperFunctions.__repr(item)).join(', ')}]` : 
-              helperFunctions.__repr(printValue);
-            
-            out.push(outputText);
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'print',
-              value: printValue,
-              outputText: outputText,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
-        }
-        // Handle function definitions
-        else if (trimmed.startsWith('def ')) {
-          const funcMatch = trimmed.match(/def\s+(\w+)\((.*?)\):/);
-          if (funcMatch) {
-            const [, funcName, params] = funcMatch;
-            
-            // Find function body (indented lines after the def statement)
-            const functionBody = [];
-            let j = originalIndex + 1;
-            while (j < lines.length && (lines[j].trimmed === '' || lines[j].indent > indent)) {
-              if (lines[j].trimmed !== '') {
-                functionBody.push(lines[j]);
-              }
-              j++;
-            }
-            
-            // Create a function object
-            const func = {
-              name: funcName,
-              params: params.split(',').map(p => p.trim()).filter(p => p),
-              body: functionBody,
-              closure: JSON.parse(JSON.stringify(vars)), // Capture current scope
-              isFunction: true
-            };
-            
-            vars[funcName] = func;
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'function_definition',
-              functionName: funcName,
-              params: func.params,
-              bodyLines: functionBody.length,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
-        }
-        // Handle function calls (standalone, not part of assignment)
-        else if (trimmed.match(/^\w+\(.*\)$/) && !trimmed.startsWith('print(')) {
-          const funcMatch = trimmed.match(/^(\w+)\((.*)\)$/);
-          if (funcMatch) {
-            const [, funcName, argsStr] = funcMatch;
-            const func = vars[funcName];
-            
-            if (func && typeof func === 'object' && func.isFunction) {
-              // Parse arguments
-              const args = argsStr ? argsStr.split(',').map(arg => safeEval(arg.trim(), vars)) : [];
-              
-              try {
-                const result = handleFunctionCall(funcName, args, vars, out);
-                
-                lineSteps.push({
-                  line: originalIndex,
-                  action: 'function_call',
-                  functionName: funcName,
-                  args: args,
-                  returnValue: result,
-                  variables: JSON.parse(JSON.stringify(vars)),
-                  output: [...out]
-                });
-              } catch (err) {
-                throw new Error(`Function call error: ${err.message}`);
-              }
+        // Regular expression evaluation
+        else {
+          try {
+            value = safeEval(expression, vars);
+          } catch (err) {
+            // If evaluation fails, check if it's a simple string or number
+            if (!isNaN(expression)) {
+              value = parseFloat(expression);
+            } else if (expression === 'True') {
+              value = true;
+            } else if (expression === 'False') {
+              value = false;
+            } else if (expression === 'None') {
+              value = null;
+            } else if (expression.startsWith('"') && expression.endsWith('"')) {
+              value = expression.slice(1, -1);
+            } else if (expression.startsWith("'") && expression.endsWith("'")) {
+              value = expression.slice(1, -1);
             } else {
-              throw new Error(`'${funcName}' is not defined`);
+              value = expression;
             }
           }
         }
-        // Handle for loops
-        else if (trimmed.startsWith('for ')) {
-          const forMatch = trimmed.match(/for\s+(\w+)\s+in\s+(.*?):/);
-          if (forMatch) {
-            const [, iterVar, iterableExpr] = forMatch;
-            let iterableValue;
-            
-            try {
-              iterableValue = safeEval(iterableExpr, vars);
-            } catch (err) {
-              iterableValue = [];
-            }
-            
-            if (!Array.isArray(iterableValue) && typeof iterableValue !== 'string') {
-              throw new Error(`'${typeof iterableValue}' object is not iterable`);
-            }
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'for_loop_start',
-              iterVar: iterVar,
-              iterable: iterableValue,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
-        }
-        // Handle if statements
-        else if (trimmed.startsWith('if ')) {
-          const condition = trimmed.slice(3, -1).trim();
-          let conditionResult;
-          
-          try {
-            conditionResult = safeEval(condition, vars);
-          } catch (err) {
-            conditionResult = false;
-          }
-          
-          lineSteps.push({
-            line: originalIndex,
-            action: 'if_statement',
-            condition: condition,
-            conditionResult: Boolean(conditionResult),
-            variables: JSON.parse(JSON.stringify(vars)),
-            output: [...out]
-          });
-        }
-        // Handle while loops
-        else if (trimmed.startsWith('while ')) {
-          const condition = trimmed.slice(6, -1).trim();
-          let conditionResult;
-          
-          try {
-            conditionResult = safeEval(condition, vars);
-          } catch (err) {
-            conditionResult = false;
-          }
-          
-          lineSteps.push({
-            line: originalIndex,
-            action: 'while_loop_start',
-            condition: condition,
-            conditionResult: Boolean(conditionResult),
-            variables: JSON.parse(JSON.stringify(vars)),
-            output: [...out]
-          });
-        }
-        // Other executable lines
-        else if (trimmed.length > 0 && !trimmed.endsWith(':')) {
-          lineSteps.push({
-            line: originalIndex,
-            action: 'execute',
-            code: trimmed,
-            variables: JSON.parse(JSON.stringify(vars)),
-            output: [...out]
-          });
-        }
-      } catch (err) {
-        console.error(`Error parsing line ${originalIndex + 1}: ${line}`, err);
+        
+        const oldValue = vars[varName];
+        vars[varName] = value;
+        
         lineSteps.push({
           line: originalIndex,
-          action: 'error',
-          error: err.message,
+          action: oldValue !== undefined ? 'reassign' : 'assign',
+          variable: varName,
+          value: value,
+          oldValue: oldValue,
+          expression: expression,
           variables: JSON.parse(JSON.stringify(vars)),
           output: [...out]
         });
       }
+      // Handle augmented assignments (like +=, -=)
+      else if (trimmed.match(/[\w]+\s*[\+\-\*\/%]=\s*.+/)) {
+        const match = trimmed.match(/(\w+)\s*([\+\-\*\/%])=(.+)/);
+        if (match) {
+          const [_, varName, operator, rightExpr] = match;
+          const oldValue = vars[varName];
+          let rightValue;
+          
+          try {
+            rightValue = safeEval(rightExpr.trim(), vars);
+          } catch (err) {
+            rightValue = rightExpr.trim();
+          }
+          
+          let newValue;
+          if (operator === '+') {
+            if (typeof oldValue === 'string' || typeof rightValue === 'string') {
+              newValue = String(oldValue) + String(rightValue);
+            } else {
+              newValue = oldValue + rightValue;
+            }
+          } else if (operator === '-') {
+            newValue = oldValue - rightValue;
+          } else if (operator === '*') {
+            newValue = oldValue * rightValue;
+          } else if (operator === '/') {
+            newValue = oldValue / rightValue;
+          } else if (operator === '%') {
+            newValue = oldValue % rightValue;
+          }
+          
+          vars[varName] = newValue;
+          
+          lineSteps.push({
+            line: originalIndex,
+            action: 'augmented_assign',
+            variable: varName,
+            operator: operator,
+            value: newValue,
+            oldValue: oldValue,
+            rightValue: rightValue,
+            variables: JSON.parse(JSON.stringify(vars)),
+            output: [...out]
+          });
+        }
+      }
+      // Handle list operations
+      else if (trimmed.match(/\w+\.(append|extend|remove|pop|insert|index|count)\(/)) {
+        const match = trimmed.match(/(\w+)\.(\w+)\((.*)\)/);
+        if (match) {
+          const [_, listName, operation, args] = match;
+          const list = vars[listName];
+          
+          if (!Array.isArray(list)) {
+            throw new Error(`'${typeof list}' object has no attribute '${operation}'`);
+          }
+          
+          const oldList = [...list];
+          let operationResult = '';
+          let resultValue = null;
+          
+          if (operation === 'append') {
+            const value = safeEval(args, vars);
+            list.push(value);
+            operationResult = `Appended ${helperFunctions.__repr(value)} to ${listName}`;
+          } 
+          else if (operation === 'extend') {
+            const iterable = safeEval(args, vars);
+            if (Array.isArray(iterable)) {
+              list.push(...iterable);
+              operationResult = `Extended ${listName} with ${helperFunctions.__repr(iterable)}`;
+            } else {
+              throw new Error(`'${typeof iterable}' object is not iterable`);
+            }
+          }
+          else if (operation === 'remove') {
+            const value = safeEval(args, vars);
+            const index = list.indexOf(value);
+            if (index > -1) {
+              list.splice(index, 1);
+              operationResult = `Removed first occurrence of ${helperFunctions.__repr(value)} from ${listName}`;
+            } else {
+              throw new Error(`Value ${helperFunctions.__repr(value)} not found in list`);
+            }
+          }
+          else if (operation === 'pop') {
+            if (args.trim() === '') {
+              resultValue = list.pop();
+              operationResult = `Popped last element (${helperFunctions.__repr(resultValue)}) from ${listName}`;
+            } else {
+              const index = parseInt(safeEval(args, vars));
+              resultValue = list.splice(index, 1)[0];
+              operationResult = `Popped element at index ${index} (${helperFunctions.__repr(resultValue)}) from ${listName}`;
+            }
+          }
+          else if (operation === 'insert') {
+            const [indexStr, valueStr] = args.split(',').map(s => s.trim());
+            const index = parseInt(safeEval(indexStr, vars));
+            const value = safeEval(valueStr, vars);
+            list.splice(index, 0, value);
+            operationResult = `Inserted ${helperFunctions.__repr(value)} at index ${index} in ${listName}`;
+          }
+          
+          vars[listName] = list;
+          
+          lineSteps.push({
+            line: originalIndex,
+            action: 'list_operation',
+            list: listName,
+            operation: operation,
+            value: list,
+            oldValue: oldList,
+            operationResult: operationResult,
+            resultValue: resultValue,
+            variables: JSON.parse(JSON.stringify(vars)),
+            output: [...out]
+          });
+        }
+      }
+      // Handle print statements with better parsing
+      else if (trimmed.startsWith('print(')) {
+        const printMatch = trimmed.match(/print\((.*)\)/);
+        if (printMatch) {
+          const args = printMatch[1];
+          
+          // Handle multiple print arguments
+          const printArgs = [];
+          if (args.trim()) {
+            // Split arguments properly
+            const argParts = [];
+            let current = '';
+            let depth = 0;
+            let inString = false;
+            let stringChar = '';
+            
+            for (let i = 0; i < args.length; i++) {
+              const char = args[i];
+              
+              if (!inString && (char === '"' || char === "'")) {
+                inString = true;
+                stringChar = char;
+              } else if (inString && char === stringChar) {
+                inString = false;
+              } else if (!inString) {
+                if (char === '(' || char === '[' || char === '{') depth++;
+                else if (char === ')' || char === ']' || char === '}') depth--;
+                else if (char === ',' && depth === 0) {
+                  argParts.push(current.trim());
+                  current = '';
+                  continue;
+                }
+              }
+              current += char;
+            }
+            if (current.trim()) argParts.push(current.trim());
+            
+            for (const arg of argParts) {
+              try {
+                const value = safeEval(arg, vars);
+                printArgs.push(value);
+              } catch (err) {
+                // If it's a string literal, remove quotes
+                if ((arg.startsWith('"') && arg.endsWith('"')) || 
+                    (arg.startsWith("'") && arg.endsWith("'"))) {
+                  printArgs.push(arg.slice(1, -1));
+                } else {
+                  printArgs.push(arg);
+                }
+              }
+            }
+          }
+          
+          const outputText = printArgs.map(arg => {
+            if (Array.isArray(arg)) {
+              return `[${arg.map(item => helperFunctions.__repr(item)).join(', ')}]`;
+            } else {
+              return helperFunctions.__repr(arg);
+            }
+          }).join(' ');
+          
+          out.push(outputText);
+          
+          lineSteps.push({
+            line: originalIndex,
+            action: 'print',
+            value: printArgs,
+            outputText: outputText,
+            variables: JSON.parse(JSON.stringify(vars)),
+            output: [...out]
+          });
+        }
+      }
+      // Handle function definitions
+      else if (trimmed.startsWith('def ')) {
+        const funcMatch = trimmed.match(/def\s+(\w+)\((.*?)\):/);
+        if (funcMatch) {
+          const [, funcName, params] = funcMatch;
+          
+          // This will be handled by the main parsing loop
+          const func = {
+            name: funcName,
+            params: params.split(',').map(p => p.trim()).filter(p => p),
+            body: [], // Will be filled by main loop
+            closure: JSON.parse(JSON.stringify(vars)),
+            isFunction: true
+          };
+          
+          vars[funcName] = func;
+          
+          lineSteps.push({
+            line: originalIndex,
+            action: 'function_definition',
+            functionName: funcName,
+            params: func.params,
+            bodyLines: 0, // Will be updated by main loop
+            variables: JSON.parse(JSON.stringify(vars)),
+            output: [...out]
+          });
+        }
+      }
+      // Handle function calls (standalone, not part of assignment)
+      else if (trimmed.match(/^\w+\(.*\)$/) && !trimmed.startsWith('print(')) {
+        const funcMatch = trimmed.match(/^(\w+)\((.*)\)$/);
+        if (funcMatch) {
+          const [, funcName, argsStr] = funcMatch;
+          const func = vars[funcName];
+          
+          if (func && typeof func === 'object' && func.isFunction) {
+            // Parse arguments
+            let args = [];
+            if (argsStr.trim()) {
+              const argParts = [];
+              let current = '';
+              let depth = 0;
+              let inString = false;
+              let stringChar = '';
+              
+              for (let i = 0; i < argsStr.length; i++) {
+                const char = argsStr[i];
+                
+                if (!inString && (char === '"' || char === "'")) {
+                  inString = true;
+                  stringChar = char;
+                } else if (inString && char === stringChar) {
+                  inString = false;
+                } else if (!inString) {
+                  if (char === '(' || char === '[' || char === '{') depth++;
+                  else if (char === ')' || char === ']' || char === '}') depth--;
+                  else if (char === ',' && depth === 0) {
+                    argParts.push(current.trim());
+                    current = '';
+                    continue;
+                  }
+                }
+                current += char;
+              }
+              if (current.trim()) argParts.push(current.trim());
+              
+              args = argParts.map(arg => safeEval(arg.trim(), vars));
+            }
+            
+            try {
+              const result = handleFunctionCall(funcName, args, vars, out);
+              
+              lineSteps.push({
+                line: originalIndex,
+                action: 'function_call',
+                functionName: funcName,
+                args: args,
+                returnValue: result,
+                variables: JSON.parse(JSON.stringify(vars)),
+                output: [...out]
+              });
+            } catch (err) {
+              throw new Error(`Function call error: ${err.message}`);
+            }
+          } else {
+            throw new Error(`'${funcName}' is not defined`);
+          }
+        }
+      }
+      // Handle for loops
+      else if (trimmed.startsWith('for ')) {
+        const forMatch = trimmed.match(/for\s+(\w+)\s+in\s+(.*?):/);
+        if (forMatch) {
+          const [, iterVar, iterableExpr] = forMatch;
+          let iterableValue;
+          
+          try {
+            iterableValue = safeEval(iterableExpr, vars);
+          } catch (err) {
+            iterableValue = [];
+          }
+          
+          if (!Array.isArray(iterableValue) && typeof iterableValue !== 'string') {
+            throw new Error(`'${typeof iterableValue}' object is not iterable`);
+          }
+          
+          lineSteps.push({
+            line: originalIndex,
+            action: 'for_loop_start',
+            iterVar: iterVar,
+            iterable: iterableValue,
+            variables: JSON.parse(JSON.stringify(vars)),
+            output: [...out]
+          });
+        }
+      }
+      // Handle if statements
+      else if (trimmed.startsWith('if ')) {
+        const condition = trimmed.slice(3, -1).trim();
+        let conditionResult;
+        
+        try {
+          conditionResult = safeEval(condition, vars);
+        } catch (err) {
+          conditionResult = false;
+        }
+        
+        lineSteps.push({
+          line: originalIndex,
+          action: 'if_statement',
+          condition: condition,
+          conditionResult: Boolean(conditionResult),
+          variables: JSON.parse(JSON.stringify(vars)),
+          output: [...out]
+        });
+      }
+      // Handle while loops
+      else if (trimmed.startsWith('while ')) {
+        const condition = trimmed.slice(6, -1).trim();
+        let conditionResult;
+        
+        try {
+          conditionResult = safeEval(condition, vars);
+        } catch (err) {
+          conditionResult = false;
+        }
+        
+        lineSteps.push({
+          line: originalIndex,
+          action: 'while_loop_start',
+          condition: condition,
+          conditionResult: Boolean(conditionResult),
+          variables: JSON.parse(JSON.stringify(vars)),
+          output: [...out]
+        });
+      }
+      // Other executable lines
+      else if (trimmed.length > 0 && !trimmed.endsWith(':')) {
+        lineSteps.push({
+          line: originalIndex,
+          action: 'execute',
+          code: trimmed,
+          variables: JSON.parse(JSON.stringify(vars)),
+          output: [...out]
+        });
+      }
+    } catch (err) {
+      console.error(`Error parsing line ${originalIndex + 1}: ${line}`, err);
+      lineSteps.push({
+        line: originalIndex,
+        action: 'error',
+        error: err.message,
+        variables: JSON.parse(JSON.stringify(vars)),
+        output: [...out]
+      });
+    }
 
-      return { steps: lineSteps, variables: vars, output: out };
-    };
+    return { steps: lineSteps, variables: vars, output: out };
+  };
+
+  // Parse Python code into executable steps
+  const parseCode = (codeString) => {
+    const lines = codeString.split('\n').map((line, i) => ({ 
+      content: line, 
+      originalIndex: i,
+      trimmed: line.trim(),
+      indent: line.length - line.trimStart().length
+    }));
+    
+    const steps = [];
+    let variables = {};
+    let output = [];
 
     // Main parsing loop with proper block handling
     for (let i = 0; i < lines.length; i++) {
@@ -724,7 +840,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             
             // Process loop body for this iteration
             for (const bodyLine of loopBody) {
-              const result = processLine(bodyLine, variables, output);
+              const result = processLine(bodyLine, variables, output, lines);
               steps.push(...result.steps);
               variables = result.variables;
               output = result.output;
@@ -748,22 +864,49 @@ const PythonCodeVisualizer = ({ initialCode }) => {
       
       // Handle function definitions (skip the body in main loop)
       if (trimmed.startsWith('def ')) {
-        const result = processLine(lines[i], variables, output);
-        steps.push(...result.steps);
-        variables = result.variables;
-        output = result.output;
-        
-        // Skip function body
-        let j = i + 1;
-        while (j < lines.length && (lines[j].trimmed === '' || lines[j].indent > indent)) {
-          j++;
+        const funcMatch = trimmed.match(/def\s+(\w+)\((.*?)\):/);
+        if (funcMatch) {
+          const [, funcName, params] = funcMatch;
+          
+          // Find function body
+          const functionBody = [];
+          let j = i + 1;
+          while (j < lines.length && (lines[j].trimmed === '' || lines[j].indent > indent)) {
+            if (lines[j].trimmed !== '') {
+              functionBody.push(lines[j]);
+            }
+            j++;
+          }
+          
+          // Create a function object
+          const func = {
+            name: funcName,
+            params: params.split(',').map(p => p.trim()).filter(p => p),
+            body: functionBody,
+            closure: JSON.parse(JSON.stringify(variables)),
+            isFunction: true
+          };
+          
+          variables[funcName] = func;
+          
+          steps.push({
+            line: originalIndex,
+            action: 'function_definition',
+            functionName: funcName,
+            params: func.params,
+            bodyLines: functionBody.length,
+            variables: JSON.parse(JSON.stringify(variables)),
+            output: [...output]
+          });
+          
+          // Skip function body
+          i = j - 1;
+          continue;
         }
-        i = j - 1;
-        continue;
       }
       
       // Process regular lines
-      const result = processLine(lines[i], variables, output);
+      const result = processLine(lines[i], variables, output, lines);
       steps.push(...result.steps);
       variables = result.variables;
       output = result.output;
