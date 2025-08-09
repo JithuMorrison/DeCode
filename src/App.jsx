@@ -108,6 +108,123 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     }
   };
 
+  // Function to parse multi-line structures (dictionaries, lists)
+  const parseMultiLineStructure = (lines, startIndex) => {
+    let structure = '';
+    let braceCount = 0;
+    let bracketCount = 0;
+    let i = startIndex;
+    
+    while (i < lines.length) {
+      const line = lines[i].trimmed;
+      structure += line;
+      
+      // Count braces and brackets
+      for (const char of line) {
+        if (char === '{') braceCount++;
+        if (char === '}') braceCount--;
+        if (char === '[') bracketCount++;
+        if (char === ']') bracketCount--;
+      }
+      
+      // If we've closed all braces and brackets, we're done
+      if (braceCount === 0 && bracketCount === 0) {
+        break;
+      }
+      
+      i++;
+      if (i < lines.length) {
+        structure += ' '; // Add space between lines
+      }
+    }
+    
+    return { structure, endIndex: i };
+  };
+
+  // Function to parse list comprehensions
+  const parseListComprehension = (expression, variables) => {
+    // Match pattern: [expr for var in iterable] or [expr for var in iterable if condition]
+    const listCompMatch = expression.match(/\[(.*?)\s+for\s+(\w+)\s+in\s+(.*?)(?:\s+if\s+(.*?))?\]/);
+    
+    if (!listCompMatch) {
+      return null;
+    }
+    
+    const [, expr, iterVar, iterableExpr, condition] = listCompMatch;
+    
+    try {
+      const iterableValue = safeEval(iterableExpr, variables);
+      if (!Array.isArray(iterableValue) && typeof iterableValue !== 'string') {
+        throw new Error(`'${typeof iterableValue}' object is not iterable`);
+      }
+      
+      const result = [];
+      for (const item of iterableValue) {
+        const tempVars = { ...variables, [iterVar]: item };
+        
+        // Check condition if it exists
+        if (condition) {
+          const conditionResult = safeEval(condition, tempVars);
+          if (!conditionResult) continue;
+        }
+        
+        // Evaluate expression
+        const value = safeEval(expr, tempVars);
+        result.push(value);
+      }
+      
+      return result;
+    } catch (err) {
+      throw new Error(`List comprehension error: ${err.message}`);
+    }
+  };
+
+  // Function to handle function definitions and calls
+  const handleFunctionCall = (funcName, args, variables, output) => {
+    const func = variables[funcName];
+    
+    if (!func || typeof func !== 'object' || !func.isFunction) {
+      throw new Error(`'${funcName}' is not defined or not a function`);
+    }
+    
+    // Create new scope for function execution
+    const functionScope = { ...func.closure };
+    
+    // Bind parameters to arguments
+    for (let i = 0; i < func.params.length; i++) {
+      if (i < args.length) {
+        functionScope[func.params[i]] = args[i];
+      }
+    }
+    
+    // Execute function body
+    let returnValue = null;
+    const functionOutput = [];
+    
+    for (const bodyLine of func.body) {
+      try {
+        // Handle return statements
+        if (bodyLine.trimmed.startsWith('return ')) {
+          const returnExpr = bodyLine.trimmed.slice(7).trim();
+          returnValue = safeEval(returnExpr, functionScope);
+          break;
+        }
+        
+        // Handle other statements in function
+        const result = processLine(bodyLine, functionScope, functionOutput);
+        Object.assign(functionScope, result.variables);
+        functionOutput.push(...result.output);
+      } catch (err) {
+        throw new Error(`Error in function '${funcName}': ${err.message}`);
+      }
+    }
+    
+    // Add function output to main output
+    output.push(...functionOutput);
+    
+    return returnValue;
+  };
+
   // Parse Python code into executable steps
   const parseCode = (codeString) => {
     const lines = codeString.split('\n').map((line, i) => ({ 
@@ -120,26 +237,6 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     const steps = [];
     let variables = {};
     let output = [];
-
-    const addOutput = (text) => {
-      output.push(text);
-    };
-
-    // Helper function to process a block of code (for loops, if blocks, etc.)
-    const processBlock = (startIndex, baseIndent) => {
-      const blockSteps = [];
-      let i = startIndex;
-      
-      while (i < lines.length && lines[i].indent > baseIndent) {
-        const result = processLine(lines[i], variables, output);
-        blockSteps.push(...result.steps);
-        variables = result.variables;
-        output = result.output;
-        i++;
-      }
-      
-      return { steps: blockSteps, nextIndex: i };
-    };
 
     // Helper function to process a single line
     const processLine = (lineData, currentVars, currentOutput) => {
@@ -155,30 +252,85 @@ const PythonCodeVisualizer = ({ initialCode }) => {
 
       try {
         // Handle variable assignment
-        if (trimmed.includes('=') && !['==', '!=', '<=', '>=', '+='].some(op => trimmed.includes(op))) {
+        if (trimmed.includes('=') && !['==', '!=', '<=', '>=', '+=', '-=', '*=', '/=', '%='].some(op => trimmed.includes(op))) {
           const parts = trimmed.split('=');
           const varName = parts[0].trim();
           const expression = parts.slice(1).join('=').trim();
           
           let value;
-          if (expression.startsWith('[') && expression.endsWith(']')) {
-            // Handle list literals
+          
+          // Check for list comprehension
+          if (expression.match(/\[.*?\s+for\s+\w+\s+in\s+.*?\]/)) {
+            try {
+              value = parseListComprehension(expression, vars);
+            } catch (err) {
+              throw new Error(`List comprehension error: ${err.message}`);
+            }
+          }
+          // Check for multi-line dictionary or list
+          else if ((expression.startsWith('{') || expression.startsWith('[')) && 
+                   (!expression.endsWith('}') && !expression.endsWith(']'))) {
+            // Find the complete structure across multiple lines
+            const { structure } = parseMultiLineStructure(lines, originalIndex);
+            const fullExpression = structure.slice(structure.indexOf(expression.charAt(0)));
+            
+            try {
+              // Parse dictionary
+              if (fullExpression.startsWith('{')) {
+                value = JSON.parse(fullExpression.replace(/'/g, '"').replace(/(\w+):/g, '"$1":'));
+              }
+              // Parse list
+              else if (fullExpression.startsWith('[')) {
+                value = JSON.parse(fullExpression.replace(/'/g, '"'));
+              }
+            } catch {
+              value = fullExpression;
+            }
+          }
+          // Handle single-line structures
+          else if (expression.startsWith('[') && expression.endsWith(']')) {
             try {
               value = JSON.parse(expression.replace(/'/g, '"'));
             } catch {
               value = expression;
             }
-          } else if (expression.startsWith('{') && expression.endsWith('}')) {
-            // Handle dict literals
+          } 
+          else if (expression.startsWith('{') && expression.endsWith('}')) {
             try {
-              value = JSON.parse(expression.replace(/'/g, '"'));
+              value = JSON.parse(expression.replace(/'/g, '"').replace(/(\w+):/g, '"$1":'));
             } catch {
               value = expression;
             }
-          } else {
-            // Evaluate other expressions
+          }
+          // Handle function calls that return values
+          else if (expression.match(/\w+\(.*\)/)) {
+            const funcMatch = expression.match(/(\w+)\((.*)\)/);
+            if (funcMatch) {
+              const [, funcName, argsStr] = funcMatch;
+              
+              if (vars[funcName] && typeof vars[funcName] === 'object' && vars[funcName].isFunction) {
+                // Parse arguments
+                const args = argsStr ? argsStr.split(',').map(arg => safeEval(arg.trim(), vars)) : [];
+                
+                try {
+                  value = handleFunctionCall(funcName, args, vars, out);
+                } catch (err) {
+                  throw new Error(`Function call error: ${err.message}`);
+                }
+              } else {
+                // Regular expression evaluation
+                try {
+                  value = safeEval(expression, vars);
+                } catch (err) {
+                  value = expression;
+                }
+              }
+            }
+          }
+          // Regular expression evaluation
+          else {
             try {
-              value = safeEval(expression, vars, { addOutput: (text) => out.push(text) });
+              value = safeEval(expression, vars);
             } catch (err) {
               value = expression;
             }
@@ -207,7 +359,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             let rightValue;
             
             try {
-              rightValue = safeEval(rightExpr.trim(), vars, { addOutput: (text) => out.push(text) });
+              rightValue = safeEval(rightExpr.trim(), vars);
             } catch (err) {
               rightValue = rightExpr.trim();
             }
@@ -260,12 +412,12 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             let resultValue = null;
             
             if (operation === 'append') {
-              const value = safeEval(args, vars, { addOutput: (text) => out.push(text) });
+              const value = safeEval(args, vars);
               list.push(value);
               operationResult = `Appended ${helperFunctions.__repr(value)} to ${listName}`;
             } 
             else if (operation === 'extend') {
-              const iterable = safeEval(args, vars, { addOutput: (text) => out.push(text) });
+              const iterable = safeEval(args, vars);
               if (Array.isArray(iterable)) {
                 list.push(...iterable);
                 operationResult = `Extended ${listName} with ${helperFunctions.__repr(iterable)}`;
@@ -274,7 +426,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
               }
             }
             else if (operation === 'remove') {
-              const value = safeEval(args, vars, { addOutput: (text) => out.push(text) });
+              const value = safeEval(args, vars);
               const index = list.indexOf(value);
               if (index > -1) {
                 list.splice(index, 1);
@@ -288,15 +440,15 @@ const PythonCodeVisualizer = ({ initialCode }) => {
                 resultValue = list.pop();
                 operationResult = `Popped last element (${helperFunctions.__repr(resultValue)}) from ${listName}`;
               } else {
-                const index = parseInt(safeEval(args, vars, { addOutput: (text) => out.push(text) }));
+                const index = parseInt(safeEval(args, vars));
                 resultValue = list.splice(index, 1)[0];
                 operationResult = `Popped element at index ${index} (${helperFunctions.__repr(resultValue)}) from ${listName}`;
               }
             }
             else if (operation === 'insert') {
               const [indexStr, valueStr] = args.split(',').map(s => s.trim());
-              const index = parseInt(safeEval(indexStr, vars, { addOutput: (text) => out.push(text) }));
-              const value = safeEval(valueStr, vars, { addOutput: (text) => out.push(text) });
+              const index = parseInt(safeEval(indexStr, vars));
+              const value = safeEval(valueStr, vars);
               list.splice(index, 0, value);
               operationResult = `Inserted ${helperFunctions.__repr(value)} at index ${index} in ${listName}`;
             }
@@ -317,75 +469,6 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             });
           }
         }
-        // Handle dictionary operations
-        else if (trimmed.match(/\w+\.(get|keys|values|items|update|pop)\(/)) {
-          const match = trimmed.match(/(\w+)\.(\w+)\((.*)\)/);
-          if (match) {
-            const [_, dictName, operation, args] = match;
-            const dict = vars[dictName];
-            
-            if (typeof dict !== 'object' || dict === null || Array.isArray(dict)) {
-              throw new Error(`'${typeof dict}' object has no attribute '${operation}'`);
-            }
-            
-            const oldDict = {...dict};
-            let operationResult = '';
-            let resultValue = null;
-            
-            if (operation === 'get') {
-              const [keyStr, defaultValue] = args.split(',').map(s => s.trim());
-              const key = safeEval(keyStr, vars, { addOutput: (text) => out.push(text) });
-              resultValue = key in dict ? dict[key] : (defaultValue ? safeEval(defaultValue, vars, { addOutput: (text) => out.push(text) }) : null);
-              operationResult = `Got value for key ${helperFunctions.__repr(key)}: ${helperFunctions.__repr(resultValue)}`;
-            }
-            else if (operation === 'keys') {
-              resultValue = Object.keys(dict);
-              operationResult = `Retrieved keys from ${dictName}`;
-            }
-            else if (operation === 'values') {
-              resultValue = Object.values(dict);
-              operationResult = `Retrieved values from ${dictName}`;
-            }
-            else if (operation === 'items') {
-              resultValue = Object.entries(dict);
-              operationResult = `Retrieved items from ${dictName}`;
-            }
-            else if (operation === 'update') {
-              const newItems = safeEval(args, vars, { addOutput: (text) => out.push(text) });
-              Object.assign(dict, newItems);
-              operationResult = `Updated ${dictName} with new items`;
-            }
-            else if (operation === 'pop') {
-              const [keyStr, defaultValue] = args.split(',').map(s => s.trim());
-              const key = safeEval(keyStr, vars, { addOutput: (text) => out.push(text) });
-              if (key in dict) {
-                resultValue = dict[key];
-                delete dict[key];
-                operationResult = `Popped key ${helperFunctions.__repr(key)} with value ${helperFunctions.__repr(resultValue)}`;
-              } else if (defaultValue) {
-                resultValue = safeEval(defaultValue, vars, { addOutput: (text) => out.push(text) });
-                operationResult = `Key ${helperFunctions.__repr(key)} not found, returned default value ${helperFunctions.__repr(resultValue)}`;
-              } else {
-                throw new Error(`KeyError: ${helperFunctions.__repr(key)}`);
-              }
-            }
-            
-            vars[dictName] = dict;
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'dict_operation',
-              dict: dictName,
-              operation: operation,
-              value: dict,
-              oldValue: oldDict,
-              operationResult: operationResult,
-              resultValue: resultValue,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
-        }
         // Handle print statements
         else if (trimmed.startsWith('print(')) {
           const printMatch = trimmed.match(/print\((.*)\)/);
@@ -394,7 +477,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             let printValue;
             
             try {
-              printValue = safeEval(args, vars, { addOutput: (text) => out.push(text) });
+              printValue = safeEval(args, vars);
             } catch (err) {
               printValue = args.replace(/['"]/g, '');
             }
@@ -415,6 +498,75 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             });
           }
         }
+        // Handle function definitions
+        else if (trimmed.startsWith('def ')) {
+          const funcMatch = trimmed.match(/def\s+(\w+)\((.*?)\):/);
+          if (funcMatch) {
+            const [, funcName, params] = funcMatch;
+            
+            // Find function body (indented lines after the def statement)
+            const functionBody = [];
+            let j = originalIndex + 1;
+            while (j < lines.length && (lines[j].trimmed === '' || lines[j].indent > indent)) {
+              if (lines[j].trimmed !== '') {
+                functionBody.push(lines[j]);
+              }
+              j++;
+            }
+            
+            // Create a function object
+            const func = {
+              name: funcName,
+              params: params.split(',').map(p => p.trim()).filter(p => p),
+              body: functionBody,
+              closure: JSON.parse(JSON.stringify(vars)), // Capture current scope
+              isFunction: true
+            };
+            
+            vars[funcName] = func;
+            
+            lineSteps.push({
+              line: originalIndex,
+              action: 'function_definition',
+              functionName: funcName,
+              params: func.params,
+              bodyLines: functionBody.length,
+              variables: JSON.parse(JSON.stringify(vars)),
+              output: [...out]
+            });
+          }
+        }
+        // Handle function calls (standalone, not part of assignment)
+        else if (trimmed.match(/^\w+\(.*\)$/) && !trimmed.startsWith('print(')) {
+          const funcMatch = trimmed.match(/^(\w+)\((.*)\)$/);
+          if (funcMatch) {
+            const [, funcName, argsStr] = funcMatch;
+            const func = vars[funcName];
+            
+            if (func && typeof func === 'object' && func.isFunction) {
+              // Parse arguments
+              const args = argsStr ? argsStr.split(',').map(arg => safeEval(arg.trim(), vars)) : [];
+              
+              try {
+                const result = handleFunctionCall(funcName, args, vars, out);
+                
+                lineSteps.push({
+                  line: originalIndex,
+                  action: 'function_call',
+                  functionName: funcName,
+                  args: args,
+                  returnValue: result,
+                  variables: JSON.parse(JSON.stringify(vars)),
+                  output: [...out]
+                });
+              } catch (err) {
+                throw new Error(`Function call error: ${err.message}`);
+              }
+            } else {
+              throw new Error(`'${funcName}' is not defined`);
+            }
+          }
+        }
         // Handle for loops
         else if (trimmed.startsWith('for ')) {
           const forMatch = trimmed.match(/for\s+(\w+)\s+in\s+(.*?):/);
@@ -423,7 +575,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             let iterableValue;
             
             try {
-              iterableValue = safeEval(iterableExpr, vars, { addOutput: (text) => out.push(text) });
+              iterableValue = safeEval(iterableExpr, vars);
             } catch (err) {
               iterableValue = [];
             }
@@ -432,7 +584,6 @@ const PythonCodeVisualizer = ({ initialCode }) => {
               throw new Error(`'${typeof iterableValue}' object is not iterable`);
             }
             
-            // Push loop start step
             lineSteps.push({
               line: originalIndex,
               action: 'for_loop_start',
@@ -449,7 +600,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
           let conditionResult;
           
           try {
-            conditionResult = safeEval(condition, vars, { addOutput: (text) => out.push(text) });
+            conditionResult = safeEval(condition, vars);
           } catch (err) {
             conditionResult = false;
           }
@@ -469,7 +620,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
           let conditionResult;
           
           try {
-            conditionResult = safeEval(condition, vars, { addOutput: (text) => out.push(text) });
+            conditionResult = safeEval(condition, vars);
           } catch (err) {
             conditionResult = false;
           }
@@ -482,53 +633,6 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             variables: JSON.parse(JSON.stringify(vars)),
             output: [...out]
           });
-        }
-        // Handle function definitions
-        else if (trimmed.startsWith('def ')) {
-          const funcMatch = trimmed.match(/def\s+(\w+)\((.*?)\):/);
-          if (funcMatch) {
-            const [, funcName, params] = funcMatch;
-            
-            // Create a function object
-            const func = {
-              name: funcName,
-              params: params.split(',').map(p => p.trim()).filter(p => p),
-              variables: JSON.parse(JSON.stringify(vars))
-            };
-            
-            vars[funcName] = func;
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'function_definition',
-              functionName: funcName,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
-        }
-        // Handle function calls
-        else if (trimmed.match(/\w+\(.*\)/) && !trimmed.startsWith('print(')) {
-          const funcMatch = trimmed.match(/(\w+)\((.*)\)/);
-          if (funcMatch) {
-            const [, funcName, args] = funcMatch;
-            const func = vars[funcName];
-            
-            if (typeof func !== 'object' || func === null) {
-              throw new Error(`'${funcName}' is not defined`);
-            }
-            
-            const argValues = args.split(',').map(arg => safeEval(arg.trim(), vars, { addOutput: (text) => out.push(text) }));
-            
-            lineSteps.push({
-              line: originalIndex,
-              action: 'function_call',
-              functionName: funcName,
-              args: argValues,
-              variables: JSON.parse(JSON.stringify(vars)),
-              output: [...out]
-            });
-          }
         }
         // Other executable lines
         else if (trimmed.length > 0 && !trimmed.endsWith(':')) {
@@ -569,7 +673,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
           let iterableValue;
           
           try {
-            iterableValue = safeEval(iterableExpr, variables, { addOutput });
+            iterableValue = safeEval(iterableExpr, variables);
           } catch (err) {
             iterableValue = [];
           }
@@ -578,11 +682,13 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             throw new Error(`'${typeof iterableValue}' object is not iterable`);
           }
           
-          // Find the loop body (indented lines after the for statement)
+          // Find the loop body
           const loopBody = [];
           let j = i + 1;
-          while (j < lines.length && lines[j].indent > indent) {
-            loopBody.push(lines[j]);
+          while (j < lines.length && (lines[j].trimmed === '' || lines[j].indent > indent)) {
+            if (lines[j].trimmed !== '') {
+              loopBody.push(lines[j]);
+            }
             j++;
           }
           
@@ -640,31 +746,19 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         }
       }
       
-      // Handle other control structures (if, while, etc.)
-      if (trimmed.endsWith(':')) {
-        // Push control structure start step
-        steps.push({
-          line: originalIndex,
-          action: 'control_structure_start',
-          code: trimmed,
-          variables: JSON.parse(JSON.stringify(variables)),
-          output: [...output]
-        });
+      // Handle function definitions (skip the body in main loop)
+      if (trimmed.startsWith('def ')) {
+        const result = processLine(lines[i], variables, output);
+        steps.push(...result.steps);
+        variables = result.variables;
+        output = result.output;
         
-        // Process the block
-        const { steps: blockSteps, nextIndex } = processBlock(i + 1, indent);
-        steps.push(...blockSteps);
-        i = nextIndex - 1;
-        
-        // Push control structure end step
-        steps.push({
-          line: originalIndex,
-          action: 'control_structure_end',
-          code: trimmed,
-          variables: JSON.parse(JSON.stringify(variables)),
-          output: [...output]
-        });
-        
+        // Skip function body
+        let j = i + 1;
+        while (j < lines.length && (lines[j].trimmed === '' || lines[j].indent > indent)) {
+          j++;
+        }
+        i = j - 1;
         continue;
       }
       
@@ -805,7 +899,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
 
   const renderVariables = () => {
     return Object.entries(executionState.variables).map(([name, value]) => {
-      const isFunction = typeof value === 'object' && value !== null && 'name' in value && 'params' in value && 'body' in value;
+      const isFunction = typeof value === 'object' && value !== null && value.isFunction;
       
       return (
         <div key={name} className={`variable ${isFunction ? 'function' : ''}`}>
@@ -840,7 +934,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
                   ))}
                 </div>
               </div>
-            ) : typeof value === 'object' && value !== null ? (
+            ) : typeof value === 'object' && value !== null && !isFunction ? (
               <div className="dict-visualization">
                 <div className="dict-info">
                   Dict[{Object.keys(value).length}]
@@ -931,6 +1025,24 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             <span className={currentStep.conditionResult ? 'condition-true' : 'condition-false'}>
               {currentStep.conditionResult ? ' True' : ' False'}
             </span>
+          </div>
+        )}
+        
+        {currentStep.functionName && (
+          <div className="detail-item">
+            <strong>Function:</strong> <span className="variable-name">{currentStep.functionName}</span>
+            {currentStep.args && (
+              <>
+                <br />
+                <strong>Arguments:</strong> [{currentStep.args.map(arg => helperFunctions.__repr(arg)).join(', ')}]
+              </>
+            )}
+            {currentStep.returnValue !== undefined && (
+              <>
+                <br />
+                <strong>Return Value:</strong> <span className="value-display">{helperFunctions.__repr(currentStep.returnValue)}</span>
+              </>
+            )}
           </div>
         )}
         
@@ -1064,22 +1176,11 @@ const PythonCodeVisualizer = ({ initialCode }) => {
   );
 };
 
-const examplePythonCode = `# Python Code Visualizer Demo
+const examplePythonCode = `# Python Code Visualizer Demo - Fixed Version
 numbers = [1, 2, 3]
 print("Initial array:", numbers)
 
-# Add elements
-numbers.append(4)
-numbers.append(5)
-print("After adding 4 and 5:", numbers)
-
-# Calculate sum
-total = 0
-for num in numbers:
-    total += num
-    print("Current sum:", total)
-
-# Dictionary example
+# Multi-line dictionary
 student = {
     "name": "Alice",
     "age": 21,
@@ -1087,22 +1188,44 @@ student = {
 }
 print("Student:", student)
 
-# Function example
-def greet(name):
-    return "Hello, " + name
+# Add elements to list
+numbers.append(4)
+numbers.append(5)
+print("After adding 4 and 5:", numbers)
 
-message = greet("Bob")
-print(message)
+# Function definition and call
+def greet(name):
+    message = "Hello, " + name + "!"
+    return message
+
+# Function call with assignment
+greeting = greet("Bob")
+print("Greeting:", greeting)
+
+# Direct function call (should show return value)
+print("Direct call:", greet("Alice"))
 
 # List comprehension
 squares = [x**2 for x in range(5)]
-print("Squares:", squares)`;
+print("Squares:", squares)
+
+# List comprehension with condition
+evens = [x for x in range(10) if x % 2 == 0]
+print("Even numbers:", evens)
+
+# Calculate sum with loop
+total = 0
+for num in numbers:
+    total += num
+    print("Current sum:", total)
+
+print("Final total:", total)`;
 
 const App = () => {
   return (
     <div className="app">
-      <h1>Python Code Visualizer</h1>
-      <p>Step through Python code execution and visualize variables in real-time</p>
+      <h1>Python Code Visualizer - Enhanced</h1>
+      <p>Step through Python code execution with support for functions, dictionaries, and list comprehensions</p>
       <PythonCodeVisualizer initialCode={examplePythonCode} />
       
       <style jsx="true" global="true">{`
@@ -1210,7 +1333,7 @@ const App = () => {
           font-size: 14px;
           line-height: 1.4;
           resize: vertical;
-          min-height: 200px;
+          min-height: 250px;
         }
         
         .visualization-container {
@@ -1387,6 +1510,8 @@ const App = () => {
           border-radius: 6px;
           padding: 8px;
           font-size: 14px;
+          max-height: 200px;
+          overflow-y: auto;
         }
         
         .array-element {
@@ -1430,6 +1555,7 @@ const App = () => {
         .dict-key {
           font-weight: bold;
           color: #2196f3;
+          min-width: 80px;
         }
         
         .dict-value {
@@ -1448,6 +1574,7 @@ const App = () => {
           font-family: 'SF Mono', monospace;
           color: #0d47a1;
           margin-bottom: 5px;
+          font-weight: bold;
         }
         
         .function-body {
@@ -1525,6 +1652,7 @@ const App = () => {
           display: flex;
           align-items: flex-start;
           gap: 10px;
+          flex-wrap: wrap;
         }
         
         .detail-item strong {
@@ -1540,11 +1668,6 @@ const App = () => {
           padding: 2px 6px;
           border-radius: 4px;
           font-size: 13px;
-        }
-        
-        .variable-name {
-          font-family: 'SF Mono', monospace;
-          color: #9c27b0;
         }
         
         .value-display {
@@ -1673,6 +1796,46 @@ const App = () => {
         input:focus, textarea:focus {
           outline: none;
           border-color: #4caf50;
+        }
+        
+        .error-text {
+          color: #f44336;
+          font-weight: bold;
+        }
+        
+        /* Scrollbar styling */
+        .variables-container::-webkit-scrollbar,
+        .code-container::-webkit-scrollbar,
+        .output-container::-webkit-scrollbar,
+        .array-elements::-webkit-scrollbar,
+        .dict-entries::-webkit-scrollbar {
+          width: 6px;
+        }
+        
+        .variables-container::-webkit-scrollbar-track,
+        .code-container::-webkit-scrollbar-track,
+        .output-container::-webkit-scrollbar-track,
+        .array-elements::-webkit-scrollbar-track,
+        .dict-entries::-webkit-scrollbar-track {
+          background: #f1f1f1;
+          border-radius: 3px;
+        }
+        
+        .variables-container::-webkit-scrollbar-thumb,
+        .code-container::-webkit-scrollbar-thumb,
+        .output-container::-webkit-scrollbar-thumb,
+        .array-elements::-webkit-scrollbar-thumb,
+        .dict-entries::-webkit-scrollbar-thumb {
+          background: #888;
+          border-radius: 3px;
+        }
+        
+        .variables-container::-webkit-scrollbar-thumb:hover,
+        .code-container::-webkit-scrollbar-thumb:hover,
+        .output-container::-webkit-scrollbar-thumb:hover,
+        .array-elements::-webkit-scrollbar-thumb:hover,
+        .dict-entries::-webkit-scrollbar-thumb:hover {
+          background: #555;
         }
       `}</style>
     </div>
