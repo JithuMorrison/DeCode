@@ -199,7 +199,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         }
         
         // Handle other statements in function
-        const result = processLine(bodyLine, functionScope, functionOutput, lines);
+        const result = processLine(bodyLine, functionScope, functionOutput);
         Object.assign(functionScope, result.variables);
         functionOutput.push(...result.output);
       } catch (err) {
@@ -840,7 +840,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             
             // Process loop body for this iteration
             for (const bodyLine of loopBody) {
-              const result = processLine(bodyLine, variables, output, lines);
+              const result = processLine(bodyLine, variables, output);
               steps.push(...result.steps);
               variables = result.variables;
               output = result.output;
