@@ -1220,7 +1220,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     <div className="python-visualizer">
       {error && (
         <div className="error-message">
-          <h3>Err</h3>
+          <h3>Error</h3>
           <pre>{error}</pre>
           <button onClick={() => setError(null)}>Dismiss</button>
         </div>
