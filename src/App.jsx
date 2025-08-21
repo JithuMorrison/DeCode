@@ -1227,7 +1227,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
       )}
       
       <div className="controls">
-        <button onClick={resetVisualization}>Resett</button>
+        <button onClick={resetVisualization}>Reset</button>
         <button onClick={prevStep} disabled={executionState.isRunning || executionState.step <= 0}>
           Previous Step
         </button>
