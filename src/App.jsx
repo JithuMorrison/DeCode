@@ -129,7 +129,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     return { structure, endIndex: i };
   };
 
-  // Function to parse list comprehensions
+  // Fixed function to parse list comprehensions
   const parseListComprehension = (expression, variables) => {
     // Match pattern: [expr for var in iterable] or [expr for var in iterable if condition]
     const listCompMatch = expression.match(/\[(.*?)\s+for\s+(\w+)\s+in\s+(.*?)(?:\s+if\s+(.*?))?\]/);
@@ -141,7 +141,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     const [, expr, iterVar, iterableExpr, condition] = listCompMatch;
     
     try {
-      const iterableValue = safeEval(iterableExpr, variables);
+      const iterableValue = safeEval(iterableExpr.trim(), variables);
       if (!Array.isArray(iterableValue) && typeof iterableValue !== 'string') {
         throw new Error(`'${typeof iterableValue}' object is not iterable`);
       }
@@ -151,14 +151,24 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         const tempVars = { ...variables, [iterVar]: item };
         
         // Check condition if it exists
-        if (condition) {
-          const conditionResult = safeEval(condition, tempVars);
-          if (!conditionResult) continue;
+        if (condition && condition.trim()) {
+          try {
+            const conditionResult = safeEval(condition.trim(), tempVars);
+            if (!conditionResult) continue;
+          } catch (err) {
+            console.error('Condition evaluation error:', err);
+            continue;
+          }
         }
         
         // Evaluate expression
-        const value = safeEval(expr, tempVars);
-        result.push(value);
+        try {
+          const value = safeEval(expr.trim(), tempVars);
+          result.push(value);
+        } catch (err) {
+          console.error('Expression evaluation error:', err);
+          continue;
+        }
       }
       
       return result;
@@ -167,7 +177,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     }
   };
 
-  // Function to handle function definitions and calls
+  // Fixed function to handle function calls
   const handleFunctionCall = (funcName, args, variables, output) => {
     const func = variables[funcName];
     
@@ -213,6 +223,51 @@ const PythonCodeVisualizer = ({ initialCode }) => {
     return returnValue;
   };
 
+  // Fixed function to parse function call arguments
+  const parseFunctionCallArgs = (argsStr) => {
+    if (!argsStr.trim()) return [];
+    
+    const args = [];
+    let current = '';
+    let depth = 0;
+    let inString = false;
+    let stringChar = '';
+    
+    for (let i = 0; i < argsStr.length; i++) {
+      const char = argsStr[i];
+      
+      if (!inString && (char === '"' || char === "'")) {
+        inString = true;
+        stringChar = char;
+        current += char;
+      } else if (inString && char === stringChar && (i === 0 || argsStr[i-1] !== '\\')) {
+        inString = false;
+        current += char;
+      } else if (!inString) {
+        if (char === '(' || char === '[' || char === '{') {
+          depth++;
+          current += char;
+        } else if (char === ')' || char === ']' || char === '}') {
+          depth--;
+          current += char;
+        } else if (char === ',' && depth === 0) {
+          args.push(current.trim());
+          current = '';
+        } else {
+          current += char;
+        }
+      } else {
+        current += char;
+      }
+    }
+    
+    if (current.trim()) {
+      args.push(current.trim());
+    }
+    
+    return args;
+  };
+
   // Helper function to process a single line
   const processLine = (lineData, currentVars, currentOutput, lines) => {
     const { content: line, originalIndex, trimmed, indent } = lineData;
@@ -238,7 +293,12 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         if (expression.match(/\[.*?\s+for\s+\w+\s+in\s+.*?\]/)) {
           try {
             value = parseListComprehension(expression, vars);
+            if (value === null) {
+              // Fall back to regular evaluation
+              value = safeEval(expression, vars);
+            }
           } catch (err) {
+            console.error('List comprehension error:', err);
             throw new Error(`List comprehension error: ${err.message}`);
           }
         }
@@ -250,38 +310,8 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             
             if (vars[funcName] && typeof vars[funcName] === 'object' && vars[funcName].isFunction) {
               // Parse arguments properly
-              let args = [];
-              if (argsStr.trim()) {
-                // Split by commas but handle nested structures
-                const argParts = [];
-                let current = '';
-                let depth = 0;
-                let inString = false;
-                let stringChar = '';
-                
-                for (let i = 0; i < argsStr.length; i++) {
-                  const char = argsStr[i];
-                  
-                  if (!inString && (char === '"' || char === "'")) {
-                    inString = true;
-                    stringChar = char;
-                  } else if (inString && char === stringChar) {
-                    inString = false;
-                  } else if (!inString) {
-                    if (char === '(' || char === '[' || char === '{') depth++;
-                    else if (char === ')' || char === ']' || char === '}') depth--;
-                    else if (char === ',' && depth === 0) {
-                      argParts.push(current.trim());
-                      current = '';
-                      continue;
-                    }
-                  }
-                  current += char;
-                }
-                if (current.trim()) argParts.push(current.trim());
-                
-                args = argParts.map(arg => safeEval(arg, vars));
-              }
+              const argParts = parseFunctionCallArgs(argsStr);
+              const args = argParts.map(arg => safeEval(arg, vars));
               
               try {
                 value = handleFunctionCall(funcName, args, vars, out);
@@ -517,38 +547,21 @@ const PythonCodeVisualizer = ({ initialCode }) => {
           // Handle multiple print arguments
           const printArgs = [];
           if (args.trim()) {
-            // Split arguments properly
-            const argParts = [];
-            let current = '';
-            let depth = 0;
-            let inString = false;
-            let stringChar = '';
-            
-            for (let i = 0; i < args.length; i++) {
-              const char = args[i];
-              
-              if (!inString && (char === '"' || char === "'")) {
-                inString = true;
-                stringChar = char;
-              } else if (inString && char === stringChar) {
-                inString = false;
-              } else if (!inString) {
-                if (char === '(' || char === '[' || char === '{') depth++;
-                else if (char === ')' || char === ']' || char === '}') depth--;
-                else if (char === ',' && depth === 0) {
-                  argParts.push(current.trim());
-                  current = '';
-                  continue;
-                }
-              }
-              current += char;
-            }
-            if (current.trim()) argParts.push(current.trim());
+            const argParts = parseFunctionCallArgs(args);
             
             for (const arg of argParts) {
               try {
-                const value = safeEval(arg, vars);
-                printArgs.push(value);
+                // Check if it's a function call first
+                const funcMatch = arg.match(/^(\w+)\((.*)\)$/);
+                if (funcMatch && vars[funcMatch[1]] && vars[funcMatch[1]].isFunction) {
+                  const [, funcName, argsStr] = funcMatch;
+                  const callArgs = parseFunctionCallArgs(argsStr).map(a => safeEval(a, vars));
+                  const result = handleFunctionCall(funcName, callArgs, vars, out);
+                  printArgs.push(result);
+                } else {
+                  const value = safeEval(arg, vars);
+                  printArgs.push(value);
+                }
               } catch (err) {
                 // If it's a string literal, remove quotes
                 if ((arg.startsWith('"') && arg.endsWith('"')) || 
@@ -618,37 +631,8 @@ const PythonCodeVisualizer = ({ initialCode }) => {
           
           if (func && typeof func === 'object' && func.isFunction) {
             // Parse arguments
-            let args = [];
-            if (argsStr.trim()) {
-              const argParts = [];
-              let current = '';
-              let depth = 0;
-              let inString = false;
-              let stringChar = '';
-              
-              for (let i = 0; i < argsStr.length; i++) {
-                const char = argsStr[i];
-                
-                if (!inString && (char === '"' || char === "'")) {
-                  inString = true;
-                  stringChar = char;
-                } else if (inString && char === stringChar) {
-                  inString = false;
-                } else if (!inString) {
-                  if (char === '(' || char === '[' || char === '{') depth++;
-                  else if (char === ')' || char === ']' || char === '}') depth--;
-                  else if (char === ',' && depth === 0) {
-                    argParts.push(current.trim());
-                    current = '';
-                    continue;
-                  }
-                }
-                current += char;
-              }
-              if (current.trim()) argParts.push(current.trim());
-              
-              args = argParts.map(arg => safeEval(arg.trim(), vars));
-            }
+            const argParts = parseFunctionCallArgs(argsStr);
+            const args = argParts.map(arg => safeEval(arg.trim(), vars));
             
             try {
               const result = handleFunctionCall(funcName, args, vars, out);
@@ -840,7 +824,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
             
             // Process loop body for this iteration
             for (const bodyLine of loopBody) {
-              const result = processLine(bodyLine, variables, output);
+              const result = processLine(bodyLine, variables, output, lines);
               steps.push(...result.steps);
               variables = result.variables;
               output = result.output;
