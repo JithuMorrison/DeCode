@@ -1265,7 +1265,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
         </div>
         
         <div className="variables-display">
-          <h3>Variables & Memor</h3>
+          <h3>Variables & Memory</h3>
           <div className="variables-container">
             {renderVariables()}
           </div>
