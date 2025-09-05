@@ -1246,7 +1246,7 @@ const PythonCodeVisualizer = ({ initialCode }) => {
       </div>
 
       <div className="editor-section">
-        <h3>Python Code Editor</h3>
+        <h3>Python Code Edito</h3>
         <textarea
           value={code}
           onChange={(e) => setCode(e.target.value)}
